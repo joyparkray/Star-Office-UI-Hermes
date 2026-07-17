@@ -9,6 +9,10 @@
 支持多 Agent 协作、中英日三语、AI 生图装修、桌面宠物模式。
 与 [OpenClaw](https://github.com/openclaw/openclaw) 深度集成时体验最佳，也可以独立部署作为状态看板使用。
 
+### Hermes 集成
+
+通过 Hermes shell hooks 可安全、自动地同步 LLM、工具、子 Agent 和会话状态。配置、鉴权、状态映射、验证与回滚方法请参阅 [Hermes 集成指南（英文）](./docs/HERMES_INTEGRATION.md)。
+
 > 本项目由 **[Ring Hyacinth](https://x.com/ring_hyacinth)** 与 **[Simon Lee](https://x.com/simonxxoo)** 共同创建（co-created project），并与社区开发者（[@Zhaohan-Wang](https://github.com/Zhaohan-Wang)、[@Jah-yee](https://github.com/Jah-yee)、[@liaoandi](https://github.com/liaoandi)）一起持续维护和共建。
 > 欢迎提交 Issue 和 PR，也感谢每一位贡献者的支持。
 

@@ -1,0 +1,33 @@
+# Replace the placeholder with the absolute path to this repository. The nested
+# quotes keep both paths intact when Hermes parses the command with shlex.split.
+hooks:
+  pre_llm_call:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  post_llm_call:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  pre_tool_call:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  post_tool_call:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  on_session_start:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  on_session_end:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  on_session_finalize:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  on_session_reset:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  subagent_start:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5
+  subagent_stop:
+    - command: '"/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/.venv/bin/python" "/ABSOLUTE/PATH/TO/Star-Office-UI-Hermes/integrations/hermes/star_office_hook.py"'
+      timeout: 5

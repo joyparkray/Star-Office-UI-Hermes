@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import hmac
+import ipaddress
 from pathlib import Path
 from security_utils import is_production_mode, is_strong_secret, is_strong_drawer_pass
 from memo_utils import get_yesterday_date_str, sanitize_content, extract_memo_from_file
@@ -70,6 +72,8 @@ RUNTIME_CONFIG_FILE = os.path.join(ROOT_DIR, "runtime-config.json")
 
 # Canonical agent states: single source of truth for validation and mapping
 VALID_AGENT_STATES = frozenset({"idle", "writing", "researching", "executing", "syncing", "error"})
+MAX_STATE_DETAIL_LENGTH = 500
+STATE_LOCK = threading.RLock()
 WORKING_STATES = frozenset({"writing", "researching", "executing"})  # subset used for auto-idle TTL
 STATE_TO_AREA_MAP = {
     "idle": "breakroom",
@@ -160,45 +164,40 @@ def load_state():
 
     This avoids the UI getting stuck at the desk when no new updates arrive.
     """
-    state = None
-    if os.path.exists(STATE_FILE):
+    with STATE_LOCK:
+        state = None
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+            except Exception:
+                state = None
+        if not isinstance(state, dict):
+            state = dict(DEFAULT_STATE)
+
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
+            ttl = int(state.get("ttl_seconds", 300))
+            updated_at = state.get("updated_at")
+            current = state.get("state", "idle")
+            if updated_at and current in WORKING_STATES:
+                dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                if dt.tzinfo:
+                    from datetime import timezone
+                    age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+                else:
+                    age = (datetime.now() - dt).total_seconds()
+                if age > ttl:
+                    state["state"] = "idle"
+                    state["detail"] = "待命中（自动回到休息区）"
+                    state["progress"] = 0
+                    state["updated_at"] = datetime.now().isoformat()
+                    try:
+                        save_state(state)
+                    except Exception:
+                        pass
         except Exception:
-            state = None
-
-    if not isinstance(state, dict):
-        state = dict(DEFAULT_STATE)
-
-    # Auto-idle
-    try:
-        ttl = int(state.get("ttl_seconds", 300))
-        updated_at = state.get("updated_at")
-        s = state.get("state", "idle")
-        if updated_at and s in WORKING_STATES:
-            # tolerate both with/without timezone
-            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-            # Use UTC for aware datetimes; local time for naive.
-            if dt.tzinfo:
-                from datetime import timezone
-                age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
-            else:
-                age = (datetime.now() - dt).total_seconds()
-            if age > ttl:
-                state["state"] = "idle"
-                state["detail"] = "待命中（自动回到休息区）"
-                state["progress"] = 0
-                state["updated_at"] = datetime.now().isoformat()
-                # persist the auto-idle so every client sees it consistently
-                try:
-                    save_state(state)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    return state
+            pass
+        return state
 
 
 def get_office_name_from_identity():
@@ -218,9 +217,44 @@ def get_office_name_from_identity():
 
 
 def save_state(state: dict):
-    """Save state to file"""
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    """Atomically save state (thread-safe within this Flask process)."""
+    with STATE_LOCK:
+        directory = os.path.dirname(os.path.abspath(STATE_FILE))
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".star-office-state-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump(state, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, STATE_FILE)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def parse_backend_host(raw_host):
+    """Return a safe Flask bind host, falling back to the compatible default."""
+    if raw_host is None:
+        return "0.0.0.0"
+    host = raw_host.strip()
+    if not host:
+        return "127.0.0.1"
+    if host == "localhost":
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", host):
+        return "127.0.0.1"
+    if (len(host) <= 253 and "." in host and
+            all(part and len(part) <= 63 and
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", part)
+                for part in host.rstrip(".").split("."))):
+        return host
+    return "127.0.0.1"
 
 
 def ensure_electron_standalone_snapshot():
@@ -1291,19 +1325,36 @@ def get_yesterday_memo():
 def set_state_endpoint():
     """Set state via POST (for UI control panel)"""
     try:
-        data = request.get_json()
+        configured_token = os.getenv("STAR_OFFICE_API_TOKEN", "")
+        if configured_token:
+            auth = request.headers.get("Authorization", "")
+            prefix = "Bearer "
+            supplied = auth[len(prefix):] if auth.startswith(prefix) else ""
+            if not supplied or not hmac.compare_digest(supplied, configured_token):
+                return jsonify({"status": "error", "msg": "unauthorized"}), 401
+
+        data = request.get_json(silent=True)
         if not isinstance(data, dict):
-            return jsonify({"status": "error", "msg": "invalid json"}), 400
-        state = load_state()
-        if "state" in data:
-            s = data["state"]
-            if s in VALID_AGENT_STATES:
-                state["state"] = s
-        if "detail" in data:
-            state["detail"] = data["detail"]
-        state["updated_at"] = datetime.now().isoformat()
-        save_state(state)
-        return jsonify({"status": "ok"})
+            return jsonify({"status": "error", "msg": "request body must be a JSON object"}), 400
+        if "state" not in data:
+            return jsonify({"status": "error", "msg": "state is required"}), 400
+        requested_state = data["state"]
+        if not isinstance(requested_state, str) or requested_state not in VALID_AGENT_STATES:
+            return jsonify({"status": "error", "msg": "invalid state"}), 400
+        detail = data.get("detail")
+        if "detail" in data and not isinstance(detail, str):
+            return jsonify({"status": "error", "msg": "detail must be a string"}), 400
+        if detail is not None and len(detail) > MAX_STATE_DETAIL_LENGTH:
+            return jsonify({"status": "error", "msg": f"detail exceeds {MAX_STATE_DETAIL_LENGTH} characters"}), 400
+
+        with STATE_LOCK:
+            state = load_state()
+            state["state"] = requested_state
+            if "detail" in data:
+                state["detail"] = detail
+            state["updated_at"] = datetime.now().isoformat()
+            save_state(state)
+        return jsonify({"status": "ok", "state": requested_state})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)}), 500
 
@@ -2078,7 +2129,11 @@ if __name__ == "__main__":
     print("Star Office UI - Backend State Service")
     print("=" * 50)
     print(f"State file: {STATE_FILE}")
-    print(f"Listening on: http://0.0.0.0:{backend_port}")
+    raw_host = os.environ.get("STAR_BACKEND_HOST")
+    backend_host = parse_backend_host(raw_host)
+    print(f"Listening on: http://{backend_host}:{backend_port}")
+    if raw_host is not None and backend_host != raw_host.strip():
+        print("Warning: invalid STAR_BACKEND_HOST; using loopback 127.0.0.1")
     if backend_port != 19000:
         print(f"(Port override: set STAR_BACKEND_PORT to change; current: {raw_port})")
     else:
@@ -2099,5 +2154,4 @@ if __name__ == "__main__":
             print("Security hardening: OK")
     print("=" * 50)
 
-    app.run(host="0.0.0.0", port=backend_port, debug=False)
-
+    app.run(host=backend_host, port=backend_port, debug=False)
