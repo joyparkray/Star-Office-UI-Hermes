@@ -72,6 +72,27 @@ class HookTests(unittest.TestCase):
         self.event("post_tool_call", extra={"tool_call_id": "wire-b", "result": '{"status":"error","secret":"NO"}'})
         self.assertEqual(self.pushes[-1][0], "error")
 
+    def test_wire_payload_json_result_exit_code(self):
+        cases = (
+            (0, "writing"),
+            (11, "error"),
+            (-11, "error"),
+            (True, "writing"),
+            (False, "writing"),
+            ("11", "writing"),
+            ("malformed", "writing"),
+        )
+        for index, (exit_code, expected) in enumerate(cases):
+            with self.subTest(exit_code=exit_code):
+                call_id = "exit-code-%s" % index
+                self.event("pre_tool_call", extra={"tool_name": "terminal", "tool_call_id": call_id})
+                self.event("post_tool_call", extra={
+                    "tool_call_id": call_id,
+                    "result": json.dumps({"exit_code": exit_code, "error": None}),
+                })
+                self.assertEqual(self.pushes[-1][0], expected)
+                self.event("on_session_reset")
+
     def test_documented_subagent_wire_payloads_track_three_children(self):
         goals = ["SECRET GOAL %s" % index for index in range(3)]
         for index in range(3):
@@ -80,7 +101,8 @@ class HookTests(unittest.TestCase):
                 "child_subagent_id": "child-%s" % index, "child_role": "worker", "child_goal": goals[index]}})
         with open(self.path, encoding="utf-8") as source:
             session = json.load(source)["sessions"]["parent"]
-        self.assertEqual(session["subagents"], ["child-0", "child-1", "child-2"])
+        self.assertEqual(session["subagents"], [
+            "child-session-0", "child-session-1", "child-session-2"])
         self.assertFalse(any(goal in detail for _, detail in self.pushes for goal in goals))
 
         statuses = ("completed", "failed", "interrupted")
@@ -94,6 +116,15 @@ class HookTests(unittest.TestCase):
         self.assertEqual(session["subagents"], [])
         self.assertEqual(session["phase"], "error")
         self.assertFalse(any(summary in detail for _, detail in self.pushes for summary in summaries))
+
+    def test_desktop_subagent_start_and_stop_pair_by_child_session_id(self):
+        self.event("subagent_start", child_session_id="child-session", child_subagent_id="sa-child")
+        self.event("subagent_stop", child_session_id="child-session", child_status="completed")
+
+        with open(self.path, encoding="utf-8") as source:
+            data = json.load(source)
+        self.assertEqual(data["sessions"]["s1"]["subagents"], [])
+        self.assertNotEqual(hook.display_state(data), "syncing")
 
     def test_parallel_calls_remove_only_match(self):
         self.event("pre_tool_call", tool_name="web_search", tool_call_id="a")

@@ -50,12 +50,12 @@ def tool_state(name):
 
 
 def explicit_child_id(payload):
-    for key in ("child_subagent_id", "child_session_id"):
+    for key in ("child_session_id", "child_subagent_id"):
         if payload.get(key) is not None:
             return str(payload[key])
     extra = payload.get("extra")
     if isinstance(extra, dict):
-        for key in ("child_subagent_id", "child_session_id"):
+        for key in ("child_session_id", "child_subagent_id"):
             if extra.get(key) is not None:
                 return str(extra[key])
     return None
@@ -96,6 +96,9 @@ def has_error(payload):
             result = None
     if isinstance(result, dict):
         if result.get("error") or result.get("is_error") is True or result.get("success") is False:
+            return True
+        exit_code = result.get("exit_code")
+        if isinstance(exit_code, (int, float)) and not isinstance(exit_code, bool) and exit_code != 0:
             return True
         candidates += [result.get("status")]
     for value in candidates:
@@ -168,7 +171,7 @@ def apply_event(data, payload):
             subagents.append(child_id)
         session["phase"] = "writing"
     elif event == "subagent_stop":
-        child_id = payload.get("child_subagent_id") or payload.get("child_session_id") or extra.get("child_subagent_id") or extra.get("child_session_id")
+        child_id = explicit_child_id(payload)
         if child_id is not None and str(child_id) in subagents:
             subagents.remove(str(child_id))
         elif child_id is not None:

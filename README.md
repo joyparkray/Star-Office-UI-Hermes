@@ -11,7 +11,7 @@
 
 ### Hermes 集成
 
-通过 Hermes shell hooks 可安全、自动地同步 LLM、工具、子 Agent 和会话状态。配置、鉴权、状态映射、验证与回滚方法请参阅 [Hermes 集成指南（英文）](./docs/HERMES_INTEGRATION.md)。
+Hermes shell hooks 可安全同步 CLI/Gateway 活动。在 Hermes v0.18.2 中，Desktop 还必须安装并启用本仓库的 `star-office-ui-status` Python 插件。安装、鉴权、验证与回滚方法请参阅 [Hermes 集成指南（英文）](./docs/HERMES_INTEGRATION.md)；安装并实测插件前请勿视为已支持 Desktop。
 
 > 本项目由 **[Ring Hyacinth](https://x.com/ring_hyacinth)** 与 **[Simon Lee](https://x.com/simonxxoo)** 共同创建（co-created project），并与社区开发者（[@Zhaohan-Wang](https://github.com/Zhaohan-Wang)、[@Jah-yee](https://github.com/Jah-yee)、[@liaoandi](https://github.com/liaoandi)）一起持续维护和共建。
 > 欢迎提交 Issue 和 PR，也感谢每一位贡献者的支持。

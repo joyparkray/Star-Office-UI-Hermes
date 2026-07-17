@@ -11,7 +11,7 @@ Best experienced with [OpenClaw](https://github.com/openclaw/openclaw), but also
 
 ### Hermes integration
 
-Hermes shell hooks can securely and automatically reflect LLM, tool, subagent, and session activity. See the [Hermes integration guide](./docs/HERMES_INTEGRATION.md) for setup, authentication, status mapping, verification, and rollback.
+Hermes shell hooks can securely reflect CLI/Gateway activity. On Hermes v0.18.2, Desktop additionally requires this repository's enabled `star-office-ui-status` Python plugin. See the [Hermes integration guide](./docs/HERMES_INTEGRATION.md) for installation, authentication, verification, and rollback; do not assume Desktop support before installing and testing the plugin.
 
 > This project was co-created by **[Ring Hyacinth](https://x.com/ring_hyacinth)** and **[Simon Lee](https://x.com/simonxxoo)**, and is continuously maintained and improved together with community contributors ([@Zhaohan-Wang](https://github.com/Zhaohan-Wang), [@Jah-yee](https://github.com/Jah-yee), [@liaoandi](https://github.com/liaoandi)).
 > Issues and PRs are welcome — thank you to everyone who contributes.
