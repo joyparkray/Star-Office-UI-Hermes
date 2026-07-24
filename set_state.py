@@ -10,6 +10,7 @@ The office UI reads state from the same state.json this script writes.
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 
 STATE_FILE = os.environ.get(
@@ -27,6 +28,7 @@ VALID_STATES = [
     "syncing",
     "error"
 ]
+MAX_DETAIL_LENGTH = 500
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -40,8 +42,21 @@ def load_state():
     }
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    directory = os.path.dirname(os.path.abspath(STATE_FILE))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".star-office-state-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -59,6 +74,9 @@ if __name__ == "__main__":
     if state_name not in VALID_STATES:
         print(f"无效状态: {state_name}")
         print(f"有效选项: {', '.join(VALID_STATES)}")
+        sys.exit(1)
+    if len(detail) > MAX_DETAIL_LENGTH:
+        print(f"描述过长（最多 {MAX_DETAIL_LENGTH} 个字符）")
         sys.exit(1)
     
     state = load_state()
