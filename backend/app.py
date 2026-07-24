@@ -73,6 +73,16 @@ RUNTIME_CONFIG_FILE = os.path.join(ROOT_DIR, "runtime-config.json")
 # Canonical agent states: single source of truth for validation and mapping
 VALID_AGENT_STATES = frozenset({"idle", "writing", "researching", "executing", "syncing", "error"})
 MAX_STATE_DETAIL_LENGTH = 500
+ACTIVITY_KINDS = frozenset({"idle", "llm", "terminal", "files", "web", "delegation", "other"})
+ACTIVITY_LABELS = {
+    "idle": "Idle",
+    "llm": "Reasoning",
+    "terminal": "Terminal activity",
+    "files": "File activity",
+    "web": "Web activity",
+    "delegation": "Delegating work",
+    "other": "Other activity",
+}
 STATE_LOCK = threading.RLock()
 WORKING_STATES = frozenset({"writing", "researching", "executing"})  # subset used for auto-idle TTL
 STATE_TO_AREA_MAP = {
@@ -231,6 +241,68 @@ def save_state(state: dict):
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+
+def _activity_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if parsed.tzinfo is not None else None
+
+
+def _safe_project_label(value):
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        return None
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    return value
+
+
+def validate_activity(value):
+    """Return a schema-only activity copy, or None when any required value is unsafe."""
+    if not isinstance(value, dict):
+        return None
+    kind = value.get("activityKind")
+    label = value.get("activityLabel")
+    project_label = _safe_project_label(value.get("projectLabel"))
+    active_subagents = value.get("activeSubagents")
+    started_at = _activity_timestamp(value.get("startedAt"))
+    updated_at = _activity_timestamp(value.get("updatedAt"))
+    events = value.get("recentEvents")
+    if (project_label is None or kind not in ACTIVITY_KINDS or
+            label != ACTIVITY_LABELS.get(kind) or
+            not isinstance(active_subagents, int) or isinstance(active_subagents, bool) or
+            not 0 <= active_subagents <= 99 or
+            started_at is None or updated_at is None or
+            not isinstance(events, list) or len(events) > 6):
+        return None
+    safe_events = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        event_kind = event.get("kind")
+        event_at = _activity_timestamp(event.get("at"))
+        if event_kind not in ACTIVITY_KINDS or event.get("label") != ACTIVITY_LABELS.get(event_kind) or event_at is None:
+            return None
+        safe_events.append({
+            "kind": event_kind,
+            "label": ACTIVITY_LABELS[event_kind],
+            "at": event_at,
+        })
+    return {
+        "projectLabel": project_label,
+        "activityKind": kind,
+        "activityLabel": ACTIVITY_LABELS[kind],
+        "activeSubagents": active_subagents,
+        "startedAt": started_at,
+        "updatedAt": updated_at,
+        "recentEvents": safe_events,
+    }
 
 
 def parse_backend_host(raw_host):
@@ -1181,6 +1253,12 @@ def leave_agent():
 def get_status():
     """Get current main state (backward compatibility). Optionally include officeName from IDENTITY.md."""
     state = load_state()
+    if "activity" in state:
+        activity = validate_activity(state["activity"])
+        if activity is None:
+            state.pop("activity", None)
+        else:
+            state["activity"] = activity
     office_name = get_office_name_from_identity()
     if office_name:
         state["officeName"] = office_name
@@ -1346,12 +1424,19 @@ def set_state_endpoint():
             return jsonify({"status": "error", "msg": "detail must be a string"}), 400
         if detail is not None and len(detail) > MAX_STATE_DETAIL_LENGTH:
             return jsonify({"status": "error", "msg": f"detail exceeds {MAX_STATE_DETAIL_LENGTH} characters"}), 400
+        activity = None
+        if "activity" in data:
+            activity = validate_activity(data["activity"])
+            if activity is None:
+                return jsonify({"status": "error", "msg": "invalid activity"}), 400
 
         with STATE_LOCK:
             state = load_state()
             state["state"] = requested_state
             if "detail" in data:
                 state["detail"] = detail
+            if "activity" in data:
+                state["activity"] = activity
             state["updated_at"] = datetime.now().isoformat()
             save_state(state)
         return jsonify({"status": "ok", "state": requested_state})

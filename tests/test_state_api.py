@@ -41,6 +41,75 @@ class StateApiTests(unittest.TestCase):
         self.assertEqual(self.saved()["state"], "writing")
         self.assertEqual(len(self.saved()["detail"]), 500)
 
+    def test_activity_is_allowlisted_validated_and_saved_with_state(self):
+        activity = {
+            "projectLabel": "Star-Office-UI-Hermes",
+            "activityKind": "files",
+            "activityLabel": "File activity",
+            "activeSubagents": 2,
+            "startedAt": "2030-01-02T03:04:05Z",
+            "updatedAt": "2030-01-02T03:05:06+00:00",
+            "recentEvents": [{
+                "kind": "files", "label": "File activity",
+                "at": "2030-01-02T03:05:06Z",
+                "command": "never persist",
+            }],
+            "prompt": "never persist",
+        }
+        response = self.client.post("/set_state", json={
+            "state": "executing", "detail": "generic", "activity": activity,
+        })
+        self.assertEqual(response.status_code, 200)
+        saved = self.saved()["activity"]
+        self.assertEqual(set(saved), {
+            "projectLabel", "activityKind", "activityLabel", "activeSubagents",
+            "startedAt", "updatedAt", "recentEvents",
+        })
+        self.assertEqual(set(saved["recentEvents"][0]), {"kind", "label", "at"})
+        self.assertNotIn("never persist", json.dumps(saved))
+        self.assertEqual(self.client.get("/status").get_json()["activity"], saved)
+
+    def test_invalid_activity_rejects_without_mutating_existing_state(self):
+        invalid = [
+            {"projectLabel": "/Users/private/project", "activityKind": "files"},
+            {"projectLabel": "safe", "activityKind": "raw_tool_name"},
+            {"projectLabel": "safe", "activityKind": "files",
+             "activityLabel": "File activity", "activeSubagents": 100,
+             "startedAt": "not-a-date", "updatedAt": "2030-01-01T00:00:00Z",
+             "recentEvents": []},
+        ]
+        for activity in invalid:
+            with self.subTest(activity=activity):
+                before = self.saved()
+                response = self.client.post("/set_state", json={
+                    "state": "writing", "activity": activity,
+                })
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(self.saved(), before)
+
+    def test_existing_state_detail_post_remains_compatible(self):
+        response = self.client.post("/set_state", json={"state": "writing", "detail": "safe generic"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.saved()["detail"], "safe generic")
+
+    def test_status_strips_malformed_activity_loaded_from_disk(self):
+        malformed = dict(self.original, activity={
+            "projectLabel": "/private/path",
+            "activityKind": "files",
+            "activityLabel": "File activity",
+            "activeSubagents": 0,
+            "startedAt": "not-a-timestamp",
+            "updatedAt": "2030-01-02T03:05:06Z",
+            "recentEvents": [],
+            "prompt": "DO_NOT_RETURN",
+        })
+        with open(self.state_file, "w", encoding="utf-8") as output:
+            json.dump(malformed, output)
+        response = self.client.get("/status")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("activity", response.get_json())
+        self.assertNotIn("DO_NOT_RETURN", response.get_data(as_text=True))
+
     def test_missing_invalid_state_and_no_mutation(self):
         for body in ({"detail": "leak"}, {"state": 1, "detail": "leak"}, {"state": "replying", "detail": "leak"}):
             with self.subTest(body=body):

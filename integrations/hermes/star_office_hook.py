@@ -8,9 +8,11 @@ except ImportError:  # pragma: no cover - exercised by import simulation
 import json
 import os
 import sys
+import sqlite3
 import tempfile
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 MAX_DETAIL_LENGTH = 500
 MAX_DELIVERY_ATTEMPTS = 2
@@ -28,6 +30,28 @@ DETAILS = {
     "syncing": "Hermes is coordinating work",
     "error": "Hermes encountered a tool error",
 }
+ACTIVITY_LABELS = {
+    "idle": "Idle",
+    "llm": "Reasoning",
+    "terminal": "Terminal activity",
+    "files": "File activity",
+    "web": "Web activity",
+    "delegation": "Delegating work",
+    "other": "Other activity",
+}
+TOOL_ACTIVITY_NAMES = {
+    "terminal": "terminal", "shell": "terminal", "exec": "terminal",
+    "exec_command": "terminal", "write_stdin": "terminal", "bash": "terminal",
+    "functions.exec_command": "terminal", "functions.write_stdin": "terminal",
+    "apply_patch": "files", "read_file": "files", "write_file": "files",
+    "find": "files", "glob": "files", "grep": "files", "rg": "files",
+    "functions.apply_patch": "files",
+    "browser": "web", "web": "web", "web_search": "web", "search_query": "web",
+    "fetch": "web", "urlopen": "web", "web.run": "web",
+    "spawn_agent": "delegation", "subagent": "delegation", "delegate": "delegation",
+    "collaboration.spawn_agent": "delegation",
+    "llm": "llm",
+}
 
 
 def diagnostic(message):
@@ -36,6 +60,56 @@ def diagnostic(message):
 
 def state_path():
     return os.getenv("STAR_OFFICE_HOOK_STATE_FILE") or os.path.join(tempfile.gettempdir(), "star-office-hermes-hook-state.json")
+
+
+def utc_timestamp():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def safe_tool_activity(name):
+    value = str(name or "").strip().lower()
+    kind = TOOL_ACTIVITY_NAMES.get(value)
+    if kind is None:
+        for safe_name, category in TOOL_ACTIVITY_NAMES.items():
+            if value.startswith(safe_name + "_") or value.startswith(safe_name + "."):
+                kind = category
+                break
+    kind = kind or "other"
+    return kind, ACTIVITY_LABELS[kind]
+
+
+def project_label(current_session_id):
+    if not isinstance(current_session_id, str) or not current_session_id or "/" in current_session_id or "\\" in current_session_id:
+        return "Hermes session"
+    home = os.getenv("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    database = Path(home) / "state.db"
+    row = None
+    try:
+        with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+            for query in (
+                    "SELECT cwd, git_repo_root FROM sessions WHERE id = ?",
+                    "SELECT cwd, git_repo_root FROM sessions WHERE session_id = ?"):
+                try:
+                    row = connection.execute(
+                        query,
+                        (current_session_id,),
+                    ).fetchone()
+                    if row is not None:
+                        break
+                except sqlite3.Error:
+                    continue
+    except (OSError, sqlite3.Error):
+        row = None
+    for workspace in (row or ()):
+        if not isinstance(workspace, str) or not workspace:
+            continue
+        label = Path(workspace.rstrip("/\\")).name
+        if (label and label not in (".", "..") and len(label) <= 64 and
+                "/" not in label and "\\" not in label and
+                all(ord(character) >= 32 and ord(character) != 127 for character in label)):
+            return label
+    return "Hermes session"
 
 
 def tool_state(name):
@@ -74,7 +148,7 @@ def explicit_correlation_id(payload):
 def normalized_tool_name(payload):
     extra = payload.get("extra")
     extra = extra if isinstance(extra, dict) else {}
-    return str(payload.get("tool_name") or extra.get("tool_name") or "tool").strip().lower()
+    return safe_tool_activity(payload.get("tool_name") or extra.get("tool_name"))[0]
 
 
 def has_error(payload):
@@ -132,6 +206,7 @@ def apply_event(data, payload):
     active = session.setdefault("active", {})
     subagents = session.setdefault("subagents", [])
     fallback_tools = session.setdefault("fallback_tools", {})
+    safe_active = session.setdefault("safe_active", {})
     extra = payload.get("extra")
     extra = extra if isinstance(extra, dict) else {}
 
@@ -139,6 +214,7 @@ def apply_event(data, payload):
         session["phase"] = "writing"
         if event == "on_session_start":
             active.clear()
+            safe_active.clear()
             subagents.clear()
             fallback_tools.clear()
     elif event == "pre_tool_call":
@@ -149,15 +225,19 @@ def apply_event(data, payload):
             call_id = "fallback:%d" % counter
             fallback_tools.setdefault(normalized_tool_name(payload), []).append(call_id)
         active[call_id] = tool_state(payload.get("tool_name") or extra.get("tool_name"))
+        safe_active[call_id] = safe_tool_activity(payload.get("tool_name") or extra.get("tool_name"))[0]
         session["phase"] = "writing"
     elif event == "post_tool_call":
         call_id = explicit_correlation_id(payload)
         if call_id is not None:
             active.pop(call_id, None)
+            safe_active.pop(call_id, None)
         else:
             queue = fallback_tools.get(normalized_tool_name(payload), [])
             if queue:
-                active.pop(queue.pop(0), None)
+                finished_id = queue.pop(0)
+                active.pop(finished_id, None)
+                safe_active.pop(finished_id, None)
                 if not queue:
                     fallback_tools.pop(normalized_tool_name(payload), None)
         session["phase"] = "error" if has_error(payload) else "writing"
@@ -183,6 +263,7 @@ def apply_event(data, payload):
         session["phase"] = "error" if failed or has_error(payload) else "writing"
     elif event in ("post_llm_call", "on_session_end"):
         active.clear()
+        safe_active.clear()
         subagents.clear()
         fallback_tools.clear()
         session["phase"] = "idle"
@@ -190,12 +271,52 @@ def apply_event(data, payload):
         sessions.pop(current_session_id, None)
     else:
         raise ValueError("unsupported event")
-    return display_state(data)
+    state = display_state(data)
+    if event in ("post_llm_call", "on_session_end", "on_session_finalize", "on_session_reset"):
+        activity_kind = "idle" if state == "idle" else "llm"
+    elif event in ("on_session_start", "pre_llm_call"):
+        activity_kind = "llm"
+    elif event in ("subagent_start", "subagent_stop"):
+        activity_kind = "delegation" if any(item.get("subagents") for item in sessions.values()) else "llm"
+    elif event == "pre_tool_call":
+        activity_kind = safe_tool_activity(payload.get("tool_name") or extra.get("tool_name"))[0]
+    else:
+        remaining_kinds = [
+            kind for item in sessions.values()
+            for kind in item.get("safe_active", {}).values()
+            if kind in ACTIVITY_LABELS
+        ]
+        activity_kind = remaining_kinds[-1] if remaining_kinds else ("other" if has_error(payload) else "llm")
+    now = utc_timestamp()
+    old_activity = data.get("activity") if isinstance(data.get("activity"), dict) else {}
+    events = old_activity.get("recentEvents") if isinstance(old_activity.get("recentEvents"), list) else []
+    if old_activity.get("activityKind") != activity_kind:
+        events = (events + [{
+            "kind": activity_kind,
+            "label": ACTIVITY_LABELS[activity_kind],
+            "at": now,
+        }])[-6:]
+        started_at = now
+    else:
+        started_at = old_activity.get("startedAt") or now
+    data["activity"] = {
+        "projectLabel": project_label(current_session_id),
+        "activityKind": activity_kind,
+        "activityLabel": ACTIVITY_LABELS[activity_kind],
+        "activeSubagents": min(99, sum(len(item.get("subagents", [])) for item in sessions.values())),
+        "startedAt": started_at,
+        "updatedAt": now,
+        "recentEvents": events[-6:],
+    }
+    return state
 
 
-def push(state, detail):
+def push(state, detail, activity=None):
     base = (os.getenv("STAR_OFFICE_URL") or DEFAULT_URL).rstrip("/")
-    body = json.dumps({"state": state, "detail": detail[:MAX_DETAIL_LENGTH]}).encode()
+    body_data = {"state": state, "detail": detail[:MAX_DETAIL_LENGTH]}
+    if activity is not None:
+        body_data["activity"] = activity
+    body = json.dumps(body_data).encode()
     headers = {"Content-Type": "application/json"}
     token = os.getenv("STAR_OFFICE_API_TOKEN", "")
     if token:
@@ -244,7 +365,7 @@ def run(payload):
 
     def reserve(data):
         state = apply_event(data, payload)
-        update = {"state": state, "detail": DETAILS[state]}
+        update = {"state": state, "detail": DETAILS[state], "activity": data["activity"]}
         desired = data.get("desired")
         if not isinstance(desired, dict) or desired.get("update") != update:
             sequence = int(data.get("sequence", 0)) + 1
@@ -261,9 +382,9 @@ def run(payload):
     sequence, update = reservation
     for _ in range(MAX_DELIVERY_ATTEMPTS):
         try:
-            push(update["state"], update["detail"])
+            push(update["state"], update["detail"], update["activity"])
         except Exception as exc:
-            diagnostic(str(exc)[:160])
+            diagnostic("activity delivery failed")
             return
 
         def delivered(data):
@@ -292,7 +413,7 @@ def main():
             raise ValueError("payload must be an object")
         run(payload)
     except Exception as exc:
-        diagnostic(str(exc)[:160])
+        diagnostic("unsupported platform" if fcntl is None else "hook event ignored")
     return 0
 
 

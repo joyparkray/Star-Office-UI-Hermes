@@ -9,6 +9,7 @@ import threading
 import unittest
 import urllib.error
 import shlex
+import sqlite3
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -31,7 +32,7 @@ class HookTests(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"STAR_OFFICE_HOOK_STATE_FILE": self.path}, clear=False)
         self.env.start()
         self.pushes = []
-        self.push_patch = mock.patch.object(hook, "push", side_effect=lambda state, detail: self.pushes.append((state, detail)))
+        self.push_patch = mock.patch.object(hook, "push", side_effect=lambda state, detail, activity=None: self.pushes.append((state, detail)))
         self.push_patch.start()
 
     def tearDown(self):
@@ -52,10 +53,81 @@ class HookTests(unittest.TestCase):
             self.assertNotIn("DO_NOT_LEAK", self.pushes[-1][1])
             self.event("on_session_reset")
 
+    def test_tool_names_map_only_to_safe_activity_categories(self):
+        cases = {
+            "terminal_exec": ("terminal", "Terminal activity"),
+            "apply_patch": ("files", "File activity"),
+            "browser_search": ("web", "Web activity"),
+            "spawn_agent": ("delegation", "Delegating work"),
+            "mystery_private_tool": ("other", "Other activity"),
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(hook.safe_tool_activity(raw), expected)
+        self.assertNotIn("mystery_private_tool", json.dumps(list(cases.values())))
+
+    def test_project_label_uses_only_database_workspace_basename_and_fallback(self):
+        hermes_home = os.path.join(self.temp.name, "hermes")
+        os.makedirs(hermes_home)
+        database = os.path.join(hermes_home, "state.db")
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, git_repo_root TEXT, title TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                ("safe-session", "/Users/private/VisibleProject", None, "SECRET TITLE"),
+            )
+        with mock.patch.dict(os.environ, {"HERMES_HOME": hermes_home}):
+            self.assertEqual(hook.project_label("safe-session"), "VisibleProject")
+            self.assertEqual(hook.project_label("missing"), "Hermes session")
+        self.assertEqual(hook.project_label("bad/session"), "Hermes session")
+
+    def test_project_label_supports_fixed_session_id_query_without_other_columns(self):
+        hermes_home = os.path.join(self.temp.name, "hermes-session-id")
+        os.makedirs(hermes_home)
+        database = os.path.join(hermes_home, "state.db")
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, cwd TEXT, git_repo_root TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?)",
+                ("safe-session", None, "/private/repos/FallbackProject"),
+            )
+        with mock.patch.dict(os.environ, {"HERMES_HOME": hermes_home}):
+            self.assertEqual(hook.project_label("safe-session"), "FallbackProject")
+
+    def test_same_kind_activity_advances_updated_at_without_resetting_started_at(self):
+        with mock.patch.object(hook, "utc_timestamp", side_effect=[
+                "2030-01-02T03:04:05Z", "2030-01-02T03:04:06Z"]):
+            self.event("pre_llm_call")
+            self.event("pre_llm_call")
+        with open(self.path, encoding="utf-8") as source:
+            activity = json.load(source)["activity"]
+        self.assertEqual(activity["startedAt"], "2030-01-02T03:04:05Z")
+        self.assertEqual(activity["updatedAt"], "2030-01-02T03:04:06Z")
+
+    def test_activity_history_is_bounded_and_contains_only_safe_events(self):
+        for index in range(9):
+            self.event("pre_tool_call", tool_name="shell --secret-%d" % index,
+                       tool_call_id=str(index), command="PRIVATE COMMAND")
+            self.event("post_tool_call", tool_name="shell --secret-%d" % index,
+                       tool_call_id=str(index), result={"error": "PRIVATE ERROR"})
+        with open(self.path, encoding="utf-8") as source:
+            activity = json.load(source)["activity"]
+        self.assertLessEqual(len(activity["recentEvents"]), 6)
+        serialized = json.dumps(activity)
+        self.assertNotIn("PRIVATE", serialized)
+        self.assertNotIn("--secret", serialized)
+        self.assertEqual(set(activity), {
+            "projectLabel", "activityKind", "activityLabel", "activeSubagents",
+            "startedAt", "updatedAt", "recentEvents",
+        })
+
     def test_edge_trigger_error_and_finish(self):
         self.event("pre_llm_call")
         self.event("pre_llm_call")
-        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(len(self.pushes), 2)
         self.event("pre_tool_call", tool_name="shell", tool_call_id="a")
         self.event("post_tool_call", tool_name="shell", tool_call_id="a", result={"status": "error", "raw": "secret"})
         self.assertEqual(self.pushes[-1], ("error", hook.DETAILS["error"]))
@@ -149,7 +221,7 @@ class HookTests(unittest.TestCase):
         with open(self.path, encoding="utf-8") as source:
             session = json.load(source)["sessions"]["s1"]
         self.assertEqual(len(session["active"]), 3)
-        self.assertEqual(session["fallback_tools"]["shell"], ["fallback:1", "fallback:2", "fallback:3"])
+        self.assertEqual(session["fallback_tools"]["terminal"], ["fallback:1", "fallback:2", "fallback:3"])
         for remaining in (2, 1, 0):
             self.event("post_tool_call", tool_name="shell")
             with open(self.path, encoding="utf-8") as source:
@@ -221,7 +293,7 @@ class HookTests(unittest.TestCase):
         self.push_patch.stop()
         attempts = []
 
-        def flaky_push(state, detail):
+        def flaky_push(state, detail, activity=None):
             attempts.append(state)
             if len(attempts) == 1:
                 raise urllib.error.URLError("down")
@@ -242,7 +314,7 @@ class HookTests(unittest.TestCase):
         release = threading.Event()
         calls = []
 
-        def delayed_push(state, detail):
+        def delayed_push(state, detail, activity=None):
             calls.append(state)
             if len(calls) == 1:
                 first_entered.set()
@@ -272,7 +344,7 @@ class HookTests(unittest.TestCase):
         backend = {"state": None}
         calls = []
 
-        def reversed_push(state, detail):
+        def reversed_push(state, detail, activity=None):
             calls.append(state)
             if state == "writing":
                 writing_entered.set()
