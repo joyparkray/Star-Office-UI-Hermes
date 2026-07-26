@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import sys
 
-
 HOOK_EVENTS = (
     "pre_llm_call",
     "post_llm_call",
@@ -19,7 +18,7 @@ HOOK_EVENTS = (
     "subagent_stop",
 )
 
-_TOP_LEVEL_FIELDS = ("tool_name", "session_id")
+_TOP_LEVEL_FIELDS = ("tool_name", "session_id", "turn_id", "user_message", "args")
 _EXTRA_FIELDS = (
     "parent_session_id",
     "task_id",
@@ -68,9 +67,12 @@ def _payload(event, kwargs):
     nested = nested if isinstance(nested, dict) else {}
     for field in _TOP_LEVEL_FIELDS:
         if field in kwargs:
-            payload[field] = kwargs[field]
+            # Hermes passes tool arguments as "args", hook expects "tool_input"
+            key = "tool_input" if field == "args" else field
+            payload[key] = kwargs[field]
         elif field in nested:
-            payload[field] = nested[field]
+            key = "tool_input" if field == "args" else field
+            payload[key] = nested[field]
     extra = {}
     for field in _EXTRA_FIELDS:
         if field in kwargs:

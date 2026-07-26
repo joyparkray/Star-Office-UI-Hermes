@@ -7,9 +7,12 @@ except ImportError:  # pragma: no cover - exercised by import simulation
     fcntl = None
 import json
 import os
+import re
+import shlex
 import sys
 import sqlite3
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -17,6 +20,7 @@ from pathlib import Path
 MAX_DETAIL_LENGTH = 500
 MAX_DELIVERY_ATTEMPTS = 2
 DEFAULT_URL = "http://127.0.0.1:19000"
+DEFAULT_SESSION_STALE_SECONDS = 300
 
 RESEARCH_WORDS = ("search", "browser", "web", "fetch", "read", "lookup", "query")
 EXECUTE_WORDS = ("terminal", "shell", "exec", "process", "command", "write", "edit", "patch", "build", "test", "compile", "file")
@@ -52,6 +56,19 @@ TOOL_ACTIVITY_NAMES = {
     "collaboration.spawn_agent": "delegation",
     "llm": "llm",
 }
+SYNC_CLI_NAMES = frozenset({"codex", "claude"})
+SHELL_NAMES = frozenset({"bash", "dash", "fish", "ksh", "sh", "zsh"})
+COMMAND_WRAPPERS = frozenset({"command", "exec", "nohup", "time"})
+SUDO_OPTIONS_WITH_VALUE = frozenset({
+    "-C", "--close-from", "-D", "--chdir", "-g", "--group",
+    "-h", "--host", "-p", "--prompt", "-R", "--chroot",
+    "-T", "--command-timeout", "-u", "--user",
+})
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+BACKGROUND_REVIEW_MARKER = (
+    "You can only call memory and skill management tools. "
+    "Other tools will be denied at runtime"
+)
 
 
 def diagnostic(message):
@@ -123,6 +140,95 @@ def tool_state(name):
     return "writing"
 
 
+def command_invokes_sync_cli(command):
+    """Recognize codex/claude in executable position without running a shell."""
+    if isinstance(command, (list, tuple)):
+        tokens = [str(item) for item in command]
+    elif isinstance(command, str):
+        try:
+            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except (TypeError, ValueError):
+            return False
+    else:
+        return False
+
+    expect_command = True
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token and all(character in ";&|()" for character in token):
+            expect_command = True
+            index += 1
+            continue
+        if not expect_command:
+            index += 1
+            continue
+        if ASSIGNMENT_RE.match(token):
+            index += 1
+            continue
+
+        executable = os.path.basename(token).lower()
+        if executable in SYNC_CLI_NAMES:
+            return True
+        if executable in COMMAND_WRAPPERS:
+            index += 1
+            continue
+        if executable == "env":
+            index += 1
+            while index < len(tokens):
+                option = tokens[index]
+                if ASSIGNMENT_RE.match(option):
+                    index += 1
+                elif option in ("-u", "--unset") and index + 1 < len(tokens):
+                    index += 2
+                elif option.startswith("-"):
+                    index += 1
+                else:
+                    break
+            continue
+        if executable == "sudo":
+            index += 1
+            while index < len(tokens):
+                option = tokens[index]
+                if option == "--":
+                    index += 1
+                    break
+                if option in SUDO_OPTIONS_WITH_VALUE and index + 1 < len(tokens):
+                    index += 2
+                elif option.startswith("-"):
+                    index += 1
+                else:
+                    break
+            continue
+        if executable in SHELL_NAMES:
+            # Handle the common `sh -c 'codex ...'` form recursively.
+            for option_index in range(index + 1, min(len(tokens), index + 4)):
+                if tokens[option_index] in ("-c", "-lc", "-cl") and option_index + 1 < len(tokens):
+                    return command_invokes_sync_cli(tokens[option_index + 1])
+            expect_command = False
+            index += 1
+            continue
+
+        expect_command = False
+        index += 1
+    return False
+
+
+def sync_cli_command(payload):
+    """Read only the documented command field, including Hermes' extra envelope."""
+    extra = payload.get("extra")
+    for source in (payload, extra):
+        if not isinstance(source, dict):
+            continue
+        tool_input = source.get("tool_input")
+        if isinstance(tool_input, dict) and "command" in tool_input:
+            return tool_input.get("command")
+    return None
+
+
 def explicit_child_id(payload):
     for key in ("child_session_id", "child_subagent_id"):
         if payload.get(key) is not None:
@@ -188,10 +294,44 @@ def session_id(payload):
                extra.get("session_id") or extra.get("parent_session_id") or "default")
 
 
+def turn_id(payload):
+    extra = payload.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    return str(payload.get("turn_id") or extra.get("turn_id") or "")
+
+
+def is_background_review_start(payload):
+    message = payload.get("user_message")
+    if message is None and isinstance(payload.get("extra"), dict):
+        message = payload["extra"].get("user_message")
+    return isinstance(message, str) and BACKGROUND_REVIEW_MARKER in message
+
+
+def session_stale_seconds():
+    try:
+        value = float(os.getenv(
+            "STAR_OFFICE_HOOK_SESSION_STALE_SECONDS",
+            str(DEFAULT_SESSION_STALE_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        value = DEFAULT_SESSION_STALE_SECONDS
+    return max(1.0, value)
+
+
 def display_state(data):
     states = []
-    for session_id in sorted(data["sessions"]):
-        session = data["sessions"][session_id]
+    last_active = data.get("last_active")
+    now = time.time()
+    for current_id in sorted(data["sessions"]):
+        session = data["sessions"][current_id]
+        updated_at = session.get("updated_at")
+        # Legacy entries have no freshness metadata. Only the session that
+        # just emitted an event may participate, preventing an old on-disk
+        # snapshot from contaminating new work forever.
+        if updated_at is None and current_id != last_active:
+            continue
+        if isinstance(updated_at, (int, float)) and now - updated_at > session_stale_seconds():
+            continue
         states.append(session.get("phase", "idle"))
         states.extend(session.get("active", {}).values())
         states.extend("syncing" for _ in session.get("subagents", []))
@@ -202,21 +342,36 @@ def apply_event(data, payload):
     event = payload.get("hook_event_name")
     current_session_id = session_id(payload)
     sessions = data.setdefault("sessions", {})
+    data["last_active"] = current_session_id
+    if event == "on_session_start":
+        # A session ID can be reused after an unclean shutdown.  Replace the
+        # whole entry so stale tools, subagents, and fallback counters cannot
+        # leak into the new session.
+        sessions[current_session_id] = {"phase": "idle", "active": {}, "subagents": []}
     session = sessions.setdefault(current_session_id, {"phase": "idle", "active": {}, "subagents": []})
+    session["updated_at"] = time.time()
     active = session.setdefault("active", {})
     subagents = session.setdefault("subagents", [])
     fallback_tools = session.setdefault("fallback_tools", {})
     safe_active = session.setdefault("safe_active", {})
+    background_reviews = session.setdefault("background_reviews", [])
     extra = payload.get("extra")
     extra = extra if isinstance(extra, dict) else {}
 
-    if event in ("on_session_start", "pre_llm_call"):
-        session["phase"] = "writing"
-        if event == "on_session_start":
-            active.clear()
-            safe_active.clear()
-            subagents.clear()
-            fallback_tools.clear()
+    if event == "on_session_start":
+        active.clear()
+        safe_active.clear()
+        subagents.clear()
+        fallback_tools.clear()
+        background_reviews.clear()
+    elif event == "pre_llm_call":
+        current_turn_id = turn_id(payload)
+        if is_background_review_start(payload):
+            if current_turn_id and current_turn_id not in background_reviews:
+                background_reviews.append(current_turn_id)
+            session["phase"] = "syncing"
+        else:
+            session["phase"] = "writing"
     elif event == "pre_tool_call":
         call_id = explicit_correlation_id(payload)
         if call_id is None:
@@ -224,9 +379,15 @@ def apply_event(data, payload):
             session["fallback_counter"] = counter
             call_id = "fallback:%d" % counter
             fallback_tools.setdefault(normalized_tool_name(payload), []).append(call_id)
-        active[call_id] = tool_state(payload.get("tool_name") or extra.get("tool_name"))
-        safe_active[call_id] = safe_tool_activity(payload.get("tool_name") or extra.get("tool_name"))[0]
-        session["phase"] = "writing"
+        active[call_id] = (
+            "syncing" if background_reviews or command_invokes_sync_cli(sync_cli_command(payload))
+            else tool_state(payload.get("tool_name") or extra.get("tool_name"))
+        )
+        safe_active[call_id] = (
+            "delegation" if background_reviews
+            else safe_tool_activity(payload.get("tool_name") or extra.get("tool_name"))[0]
+        )
+        session["phase"] = "syncing" if background_reviews else "writing"
     elif event == "post_tool_call":
         call_id = explicit_correlation_id(payload)
         if call_id is not None:
@@ -240,7 +401,12 @@ def apply_event(data, payload):
                 safe_active.pop(finished_id, None)
                 if not queue:
                     fallback_tools.pop(normalized_tool_name(payload), None)
-        session["phase"] = "error" if has_error(payload) else "writing"
+        session["phase"] = (
+            "error" if has_error(payload)
+            else "syncing" if background_reviews
+            else "writing" if active or subagents
+            else "idle"
+        )
     elif event == "subagent_start":
         child_id = explicit_child_id(payload)
         if child_id is None:
@@ -258,15 +424,23 @@ def apply_event(data, payload):
             diagnostic("ignoring stop for an untracked subagent")
         elif child_id is None and subagents:
             subagents.pop(0)
+        if child_id is not None and str(child_id) != current_session_id:
+            # Tool hooks emitted by a child may have created a session entry
+            # under the child's own ID.  Its lifecycle is owned by this stop
+            # event, so discard that orphan along with the parent's tracking.
+            sessions.pop(str(child_id), None)
         child_status = payload.get("child_status") or extra.get("child_status")
         failed = isinstance(child_status, str) and child_status.lower() in ("failed", "error", "interrupted")
         session["phase"] = "error" if failed or has_error(payload) else "writing"
     elif event in ("post_llm_call", "on_session_end"):
+        current_turn_id = turn_id(payload)
+        if current_turn_id in background_reviews:
+            background_reviews.remove(current_turn_id)
         active.clear()
         safe_active.clear()
         subagents.clear()
         fallback_tools.clear()
-        session["phase"] = "idle"
+        session["phase"] = "syncing" if background_reviews else "idle"
     elif event in ("on_session_finalize", "on_session_reset"):
         sessions.pop(current_session_id, None)
     else:

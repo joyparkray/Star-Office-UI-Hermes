@@ -53,7 +53,8 @@ class PluginTests(unittest.TestCase):
         with mock.patch.object(self.plugin, "_load_bridge", return_value=bridge):
             result = self.context.hooks["pre_tool_call"](
                 tool_name="terminal", session_id="session", task_id="task",
-                tool_call_id="call", args={"command": "SECRET"}, command="SECRET",
+                tool_call_id="call", turn_id="turn",
+                args={"command": "codex exec"}, command="SECRET",
                 prompt="SECRET", child_goal="SECRET", child_summary="SECRET",
                 conversation_history=["SECRET"], unrelated="SECRET")
         self.assertIsNone(result)
@@ -61,8 +62,21 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(payload["hook_event_name"], "pre_tool_call")
         self.assertEqual(payload["tool_name"], "terminal")
         self.assertEqual(payload["session_id"], "session")
+        self.assertEqual(payload["turn_id"], "turn")
+        self.assertEqual(payload["tool_input"], {"command": "codex exec"})
         self.assertEqual(payload["extra"], {"task_id": "task", "tool_call_id": "call"})
         self.assertNotIn("SECRET", repr(payload))
+
+    def test_pre_llm_payload_forwards_review_identity_fields(self):
+        bridge = mock.Mock()
+        with mock.patch.object(self.plugin, "_load_bridge", return_value=bridge):
+            self.context.hooks["pre_llm_call"](
+                session_id="session", turn_id="review-turn",
+                user_message="review marker", conversation_history=["PRIVATE"])
+        payload = bridge.run.call_args.args[0]
+        self.assertEqual(payload["turn_id"], "review-turn")
+        self.assertEqual(payload["user_message"], "review marker")
+        self.assertNotIn("conversation_history", repr(payload))
 
     def test_post_tool_payload_keeps_ids_status_and_result_only(self):
         bridge = mock.Mock()

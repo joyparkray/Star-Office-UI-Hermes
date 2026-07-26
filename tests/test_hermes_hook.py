@@ -53,6 +53,99 @@ class HookTests(unittest.TestCase):
             self.assertNotIn("DO_NOT_LEAK", self.pushes[-1][1])
             self.event("on_session_reset")
 
+    def test_codex_and_claude_commands_use_syncing_until_completion(self):
+        commands = (
+            "codex exec --full-auto 'review this'",
+            "/opt/tools/claude -p 'review this'",
+            "cd /tmp && env MODE=review codex exec",
+            "sudo -u nobody claude -p review",
+            "bash -lc 'claude -p review'",
+            ["codex", "exec", "review"],
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                call_id = "sync-cli-%d" % index
+                self.event("pre_tool_call", tool_name="terminal", tool_call_id=call_id,
+                           tool_input={"command": command})
+                self.assertEqual(self.pushes[-1][0], "syncing")
+                self.event("post_tool_call", tool_name="terminal", tool_call_id=call_id)
+                self.assertEqual(self.pushes[-1][0], "idle")
+                self.event("on_session_reset")
+
+    def test_sync_cli_detection_requires_executable_position(self):
+        commands = (
+            "echo codex",
+            "printf '%s' claude",
+            "python script.py --provider codex",
+            "cat /tmp/claude.log",
+            "my-codex-wrapper run",
+            "echo codex && true",
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                call_id = "ordinary-cli-%d" % index
+                self.event("pre_tool_call", tool_name="terminal", tool_call_id=call_id,
+                           tool_input={"command": command})
+                self.assertEqual(self.pushes[-1][0], "executing")
+                self.event("on_session_reset")
+
+    def test_sync_cli_command_supports_extra_envelope(self):
+        self.event("pre_tool_call", extra={
+            "tool_name": "terminal",
+            "tool_call_id": "extra-command",
+            "tool_input": {"command": "command claude --print"},
+        })
+        self.assertEqual(self.pushes[-1][0], "syncing")
+
+    def test_background_review_stays_syncing_until_its_turn_finishes(self):
+        review_message = (
+            "Review the conversation.\n\n"
+            + hook.BACKGROUND_REVIEW_MARKER
+            + " — do not attempt them."
+        )
+        self.event("pre_llm_call", turn_id="review-turn", user_message=review_message)
+        self.assertEqual(self.pushes[-1][0], "syncing")
+
+        # The foreground turn can emit its end hook after the review thread
+        # starts. It must not make the review animation disappear.
+        self.event("on_session_end", turn_id="foreground-turn")
+        self.assertEqual(self.pushes[-1][0], "syncing")
+
+        self.event("pre_tool_call", turn_id="review-turn", tool_name="skills",
+                   tool_call_id="review-tool", tool_input={"action": "update"})
+        self.assertEqual(self.pushes[-1][0], "syncing")
+        self.event("post_tool_call", turn_id="review-turn", tool_name="skills",
+                   tool_call_id="review-tool")
+        self.assertEqual(self.pushes[-1][0], "syncing")
+        self.event("post_llm_call", turn_id="review-turn")
+        self.assertEqual(self.pushes[-1][0], "idle")
+
+    def test_fresh_sessions_share_global_priority_but_stale_sessions_do_not(self):
+        self.event("pre_tool_call", session_id="old", tool_name="delegate_agent",
+                   tool_call_id="old-sync")
+        self.event("pre_tool_call", session_id="current", tool_name="shell",
+                   tool_call_id="current-exec")
+        with open(self.path, encoding="utf-8") as source:
+            data = json.load(source)
+        self.assertEqual(hook.display_state(data), "syncing")
+
+        data["sessions"]["old"]["updated_at"] = 1
+        with mock.patch.object(hook.time, "time", return_value=1000), \
+                mock.patch.dict(os.environ, {
+                    "STAR_OFFICE_HOOK_SESSION_STALE_SECONDS": "10",
+                }, clear=False):
+            self.assertEqual(hook.display_state(data), "executing")
+
+    def test_legacy_session_without_timestamp_cannot_pollute_current_session(self):
+        data = {
+            "sessions": {
+                "s1": {"phase": "syncing", "active": {"stale": "syncing"}},
+                "s2": {"phase": "idle", "active": {}, "updated_at": hook.time.time()},
+            },
+            "last_active": "s2",
+        }
+        self.assertEqual(hook.display_state(data), "idle")
+
     def test_tool_names_map_only_to_safe_activity_categories(self):
         cases = {
             "terminal_exec": ("terminal", "Terminal activity"),
@@ -146,13 +239,13 @@ class HookTests(unittest.TestCase):
 
     def test_wire_payload_json_result_exit_code(self):
         cases = (
-            (0, "writing"),
+            (0, "idle"),
             (11, "error"),
             (-11, "error"),
-            (True, "writing"),
-            (False, "writing"),
-            ("11", "writing"),
-            ("malformed", "writing"),
+            (True, "idle"),
+            (False, "idle"),
+            ("11", "idle"),
+            ("malformed", "idle"),
         )
         for index, (exit_code, expected) in enumerate(cases):
             with self.subTest(exit_code=exit_code):

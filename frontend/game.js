@@ -187,7 +187,7 @@ const BUBBLE_TEXTS = {
   ]
 };
 
-let game, star, sofa, serverroom, areas = {}, currentState = 'idle', pendingDesiredState = null, statusText, lastFetch = 0, lastBlink = 0, lastBubble = 0, targetX = 660, targetY = 170, bubble = null, typewriterText = '', typewriterTarget = '', typewriterIndex = 0, lastTypewriter = 0, syncAnimSprite = null, catBubble = null;
+let game, star, sofa, serverroom, areas = {}, currentState = 'idle', pendingDesiredState = null, statusText, lastFetch = 0, lastBlink = 0, lastBubble = 0, targetX = 660, targetY = 170, bubble = null, typewriterText = '', typewriterTarget = '', typewriterIndex = 0, lastTypewriter = 0, syncAnimSprite = null, syncAnimPlayable = false, catBubble = null;
 let isMoving = false;
 let waypoints = [];
 let lastWanderAt = 0;
@@ -314,7 +314,7 @@ function preload() {
   this.load.spritesheet('cats', '/static/cats-spritesheet' + (supportsWebP ? '.webp' : '.png'), { frameWidth: 160, frameHeight: 160 });
   this.load.image('desk', '/static/desk' + getExt('desk.png'));
   this.load.spritesheet('star_working', '/static/star-working-spritesheet-grid' + (supportsWebP ? '.webp' : '.png'), { frameWidth: 230, frameHeight: 144 });
-  this.load.spritesheet('sync_anim', '/static/sync-animation-spritesheet-grid' + (supportsWebP ? '.webp' : '.png'), { frameWidth: 256, frameHeight: 256 });
+  this.load.spritesheet('sync_anim', '/static/sync-animation-v3-grid.webp?v={{VERSION_TIMESTAMP}}', { frameWidth: 256, frameHeight: 256 });
   this.load.image('memo_bg', '/static/memo-bg' + (supportsWebP ? '.webp' : '.png'));
 
   // 新办公桌：强制 PNG（透明）
@@ -525,12 +525,19 @@ function create() {
   window.starWorking = starWorking;
 
   // === 同步动画（来自 LAYOUT）===
-  this.anims.create({
-    key: 'sync_anim',
-    frames: this.anims.generateFrameNumbers('sync_anim', { start: 1, end: 52 }),
-    frameRate: 12,
-    repeat: -1
-  });
+  const syncFrameTotal = Number(this.textures.get('sync_anim')?.frameTotal || 0);
+  const syncFrameStart = 1;
+  const syncFrameEnd = Math.max(0, syncFrameTotal - 2);
+  syncAnimPlayable = syncFrameTotal >= 3 && syncFrameEnd >= syncFrameStart;
+  if (this.anims.exists('sync_anim')) this.anims.remove('sync_anim');
+  if (syncAnimPlayable) {
+    this.anims.create({
+      key: 'sync_anim',
+      frames: this.anims.generateFrameNumbers('sync_anim', { start: syncFrameStart, end: syncFrameEnd }),
+      frameRate: 12,
+      repeat: -1
+    });
+  }
   syncAnimSprite = this.add.sprite(
     LAYOUT.furniture.syncAnim.x,
     LAYOUT.furniture.syncAnim.y,
@@ -663,7 +670,7 @@ function update(time) {
 
   if (syncAnimSprite) {
     if (effectiveStateForServer === 'syncing') {
-      if (!syncAnimSprite.anims.isPlaying || syncAnimSprite.anims.currentAnim?.key !== 'sync_anim') {
+      if (syncAnimPlayable && (!syncAnimSprite.anims.isPlaying || syncAnimSprite.anims.currentAnim?.key !== 'sync_anim')) {
         syncAnimSprite.anims.play('sync_anim', true);
       }
     } else {
@@ -767,7 +774,7 @@ function fetchStatus() {
 
         if (syncAnimSprite) {
           if (nextState === 'syncing') {
-            if (!syncAnimSprite.anims.isPlaying || syncAnimSprite.anims.currentAnim?.key !== 'sync_anim') {
+            if (syncAnimPlayable && (!syncAnimSprite.anims.isPlaying || syncAnimSprite.anims.currentAnim?.key !== 'sync_anim')) {
               syncAnimSprite.anims.play('sync_anim', true);
             }
           } else {

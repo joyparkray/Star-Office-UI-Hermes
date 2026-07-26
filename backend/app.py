@@ -84,7 +84,7 @@ ACTIVITY_LABELS = {
     "other": "Other activity",
 }
 STATE_LOCK = threading.RLock()
-WORKING_STATES = frozenset({"writing", "researching", "executing"})  # subset used for auto-idle TTL
+WORKING_STATES = frozenset({"writing", "researching", "executing", "syncing"})  # subset used for auto-idle TTL
 STATE_TO_AREA_MAP = {
     "idle": "breakroom",
     "writing": "writing",
@@ -169,7 +169,7 @@ def load_state():
     """Load state from file.
 
     Includes a simple auto-idle mechanism:
-    - If the last update is older than ttl_seconds (default 25s)
+    - If the last update is older than ttl_seconds (default 300s)
       and the state is a "working" state, we fall back to idle.
 
     This avoids the UI getting stuck at the desk when no new updates arrive.
@@ -205,6 +205,23 @@ def load_state():
                         save_state(state)
                     except Exception:
                         pass
+        except Exception:
+            pass
+        return state
+
+
+def reset_working_state_on_startup():
+    """Discard a working snapshot left behind by a stopped backend."""
+    with STATE_LOCK:
+        state = load_state()
+        if state.get("state") not in WORKING_STATES:
+            return state
+        state["state"] = "idle"
+        state["detail"] = "待命中（服务已重启）"
+        state["progress"] = 0
+        state["updated_at"] = datetime.now().isoformat()
+        try:
+            save_state(state)
         except Exception:
             pass
         return state
@@ -2202,6 +2219,7 @@ def assets_upload():
 
 
 if __name__ == "__main__":
+    reset_working_state_on_startup()
     raw_port = os.environ.get("STAR_BACKEND_PORT", "19000")
     try:
         backend_port = int(raw_port)

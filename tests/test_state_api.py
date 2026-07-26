@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -40,6 +41,53 @@ class StateApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.saved()["state"], "writing")
         self.assertEqual(len(self.saved()["detail"]), 500)
+
+    def test_expired_syncing_state_auto_idles(self):
+        expired = {
+            "state": "syncing",
+            "detail": "generic",
+            "progress": 0,
+            "ttl_seconds": 1,
+            "updated_at": (datetime.now() - timedelta(seconds=10)).isoformat(),
+        }
+        with open(self.state_file, "w", encoding="utf-8") as output:
+            json.dump(expired, output)
+
+        loaded = app_module.load_state()
+
+        self.assertEqual(loaded["state"], "idle")
+        self.assertEqual(self.saved()["state"], "idle")
+
+    def test_backend_startup_resets_fresh_working_snapshot(self):
+        fresh = {
+            "state": "executing",
+            "detail": "stale process work",
+            "progress": 50,
+            "updated_at": datetime.now().isoformat(),
+        }
+        with open(self.state_file, "w", encoding="utf-8") as output:
+            json.dump(fresh, output)
+
+        loaded = app_module.reset_working_state_on_startup()
+
+        self.assertEqual(loaded["state"], "idle")
+        self.assertEqual(loaded["progress"], 0)
+        self.assertEqual(self.saved()["state"], "idle")
+
+    def test_backend_startup_preserves_error_snapshot(self):
+        error = {
+            "state": "error",
+            "detail": "needs attention",
+            "progress": 0,
+            "updated_at": datetime.now().isoformat(),
+        }
+        with open(self.state_file, "w", encoding="utf-8") as output:
+            json.dump(error, output)
+
+        loaded = app_module.reset_working_state_on_startup()
+
+        self.assertEqual(loaded, error)
+        self.assertEqual(self.saved(), error)
 
     def test_activity_is_allowlisted_validated_and_saved_with_state(self):
         activity = {
