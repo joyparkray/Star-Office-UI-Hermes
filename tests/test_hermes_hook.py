@@ -45,6 +45,10 @@ class HookTests(unittest.TestCase):
         payload.update(values)
         hook.run(payload)
 
+    def test_session_start_does_not_push_idle_state(self):
+        self.event("on_session_start")
+        self.assertEqual(self.pushes, [])
+
     def test_mapping_and_redacted_generic_details(self):
         cases = [("web_search", "researching"), ("terminal_exec", "executing"), ("delegate_agent", "syncing"), ("mystery", "writing")]
         for index, (tool, expected) in enumerate(cases):
@@ -71,6 +75,27 @@ class HookTests(unittest.TestCase):
                 self.event("post_tool_call", tool_name="terminal", tool_call_id=call_id)
                 self.assertEqual(self.pushes[-1][0], "idle")
                 self.event("on_session_reset")
+
+    def test_sync_cli_survives_out_of_order_llm_and_session_end(self):
+        self.event("pre_llm_call", turn_id="turn-a")
+        self.event(
+            "pre_tool_call", turn_id="turn-a", tool_name="terminal",
+            tool_call_id="codex-call",
+            tool_input={"command": "cat prompt | codex exec --full-auto -"},
+        )
+        self.assertEqual(self.pushes[-1][0], "syncing")
+
+        self.event("post_llm_call", turn_id="turn-a")
+        self.assertEqual(self.pushes[-1][0], "syncing")
+        self.event("on_session_end", turn_id="turn-a")
+        self.assertEqual(self.pushes[-1][0], "syncing")
+
+        self.event(
+            "post_tool_call", turn_id="turn-a", tool_name="terminal",
+            tool_call_id="codex-call", status="ok",
+            result={"exit_code": 0, "error": None},
+        )
+        self.assertEqual(self.pushes[-1][0], "idle")
 
     def test_sync_cli_detection_requires_executable_position(self):
         commands = (
@@ -145,6 +170,26 @@ class HookTests(unittest.TestCase):
             "last_active": "s2",
         }
         self.assertEqual(hook.display_state(data), "idle")
+
+    def test_old_schema_with_orphan_fallback_tools_is_discarded(self):
+        with open(self.path, "w", encoding="utf-8") as output:
+            json.dump({
+                "sessions": {
+                    "s1": {
+                        "phase": "writing",
+                        "active": {"fallback:1": "syncing"},
+                        "fallback_tools": {"terminal": ["fallback:1"]},
+                    },
+                },
+                "last_push": {"state": "syncing"},
+            }, output)
+
+        self.event("pre_llm_call", session_id="real", turn_id="foreground")
+        with open(self.path, encoding="utf-8") as source:
+            data = json.load(source)
+        self.assertEqual(data["schema_version"], hook.STATE_SCHEMA_VERSION)
+        self.assertNotIn("s1", data["sessions"])
+        self.assertEqual(self.pushes[-1][0], "writing")
 
     def test_tool_names_map_only_to_safe_activity_categories(self):
         cases = {
@@ -236,6 +281,15 @@ class HookTests(unittest.TestCase):
         self.event("pre_tool_call", extra={"tool_name": "shell", "tool_call_id": "wire-b"})
         self.event("post_tool_call", extra={"tool_call_id": "wire-b", "result": '{"status":"error","secret":"NO"}'})
         self.assertEqual(self.pushes[-1][0], "error")
+
+    def test_explicit_ok_status_does_not_treat_result_data_as_tool_error(self):
+        self.event("pre_tool_call", tool_name="terminal", tool_call_id="ok-data")
+        self.event(
+            "post_tool_call", tool_name="terminal", tool_call_id="ok-data",
+            status="ok",
+            result={"error": "quoted diagnostic from a successful command"},
+        )
+        self.assertEqual(self.pushes[-1][0], "idle")
 
     def test_wire_payload_json_result_exit_code(self):
         cases = (

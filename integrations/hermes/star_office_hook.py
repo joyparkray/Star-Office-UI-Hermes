@@ -21,6 +21,7 @@ MAX_DETAIL_LENGTH = 500
 MAX_DELIVERY_ATTEMPTS = 2
 DEFAULT_URL = "http://127.0.0.1:19000"
 DEFAULT_SESSION_STALE_SECONDS = 300
+STATE_SCHEMA_VERSION = 2
 
 RESEARCH_WORDS = ("search", "browser", "web", "fetch", "read", "lookup", "query")
 EXECUTE_WORDS = ("terminal", "shell", "exec", "process", "command", "write", "edit", "patch", "build", "test", "compile", "file")
@@ -258,14 +259,21 @@ def normalized_tool_name(payload):
 
 
 def has_error(payload):
-    if payload.get("error") or payload.get("is_error") is True or payload.get("success") is False:
-        return True
     candidates = [payload.get("status")]
     extra = payload.get("extra")
     if isinstance(extra, dict):
+        candidates += [extra.get("status")]
+    # Hermes emits an authoritative observer status.  In particular, an
+    # otherwise successful tool result may legitimately contain an "error"
+    # field as data; that must not turn the office red.
+    explicit_statuses = [value.lower() for value in candidates if isinstance(value, str)]
+    if explicit_statuses:
+        return any(value in ("error", "failed", "failure") for value in explicit_statuses)
+    if payload.get("error") or payload.get("is_error") is True or payload.get("success") is False:
+        return True
+    if isinstance(extra, dict):
         if extra.get("error") or extra.get("is_error") is True or extra.get("success") is False:
             return True
-        candidates += [extra.get("status")]
     result = payload.get("result")
     if result is None and isinstance(extra, dict):
         result = extra.get("result")
@@ -334,6 +342,11 @@ def display_state(data):
             continue
         states.append(session.get("phase", "idle"))
         states.extend(session.get("active", {}).values())
+        states.extend(
+            "syncing" if item.get("review") else "writing"
+            for item in session.get("turns", {}).values()
+            if item.get("llm_active")
+        )
         states.extend("syncing" for _ in session.get("subagents", []))
     return max(states or ["idle"], key=lambda item: PRIORITY.get(item, 0))
 
@@ -347,14 +360,18 @@ def apply_event(data, payload):
         # A session ID can be reused after an unclean shutdown.  Replace the
         # whole entry so stale tools, subagents, and fallback counters cannot
         # leak into the new session.
-        sessions[current_session_id] = {"phase": "idle", "active": {}, "subagents": []}
-    session = sessions.setdefault(current_session_id, {"phase": "idle", "active": {}, "subagents": []})
+        sessions[current_session_id] = {"phase": "idle", "active": {}, "subagents": [], "turns": {}}
+    session = sessions.setdefault(current_session_id, {
+        "phase": "idle", "active": {}, "subagents": [], "turns": {},
+    })
     session["updated_at"] = time.time()
     active = session.setdefault("active", {})
     subagents = session.setdefault("subagents", [])
     fallback_tools = session.setdefault("fallback_tools", {})
     safe_active = session.setdefault("safe_active", {})
     background_reviews = session.setdefault("background_reviews", [])
+    turns = session.setdefault("turns", {})
+    active_turns = session.setdefault("active_turns", {})
     extra = payload.get("extra")
     extra = extra if isinstance(extra, dict) else {}
 
@@ -364,9 +381,14 @@ def apply_event(data, payload):
         subagents.clear()
         fallback_tools.clear()
         background_reviews.clear()
+        turns.clear()
+        active_turns.clear()
     elif event == "pre_llm_call":
         current_turn_id = turn_id(payload)
-        if is_background_review_start(payload):
+        review = is_background_review_start(payload)
+        if current_turn_id:
+            turns[current_turn_id] = {"llm_active": True, "review": review}
+        if review:
             if current_turn_id and current_turn_id not in background_reviews:
                 background_reviews.append(current_turn_id)
             session["phase"] = "syncing"
@@ -380,30 +402,36 @@ def apply_event(data, payload):
             call_id = "fallback:%d" % counter
             fallback_tools.setdefault(normalized_tool_name(payload), []).append(call_id)
         active[call_id] = (
-            "syncing" if background_reviews or command_invokes_sync_cli(sync_cli_command(payload))
+            "syncing" if (
+                turns.get(turn_id(payload), {}).get("review")
+                or command_invokes_sync_cli(sync_cli_command(payload))
+            )
             else tool_state(payload.get("tool_name") or extra.get("tool_name"))
         )
+        active_turns[call_id] = turn_id(payload)
         safe_active[call_id] = (
-            "delegation" if background_reviews
+            "delegation" if turns.get(turn_id(payload), {}).get("review")
             else safe_tool_activity(payload.get("tool_name") or extra.get("tool_name"))[0]
         )
-        session["phase"] = "syncing" if background_reviews else "writing"
+        session["phase"] = "syncing" if turns.get(turn_id(payload), {}).get("review") else "writing"
     elif event == "post_tool_call":
         call_id = explicit_correlation_id(payload)
         if call_id is not None:
             active.pop(call_id, None)
             safe_active.pop(call_id, None)
+            active_turns.pop(call_id, None)
         else:
             queue = fallback_tools.get(normalized_tool_name(payload), [])
             if queue:
                 finished_id = queue.pop(0)
                 active.pop(finished_id, None)
                 safe_active.pop(finished_id, None)
+                active_turns.pop(finished_id, None)
                 if not queue:
                     fallback_tools.pop(normalized_tool_name(payload), None)
         session["phase"] = (
             "error" if has_error(payload)
-            else "syncing" if background_reviews
+            else "syncing" if any(item.get("review") and item.get("llm_active") for item in turns.values())
             else "writing" if active or subagents
             else "idle"
         )
@@ -436,11 +464,18 @@ def apply_event(data, payload):
         current_turn_id = turn_id(payload)
         if current_turn_id in background_reviews:
             background_reviews.remove(current_turn_id)
-        active.clear()
-        safe_active.clear()
-        subagents.clear()
-        fallback_tools.clear()
-        session["phase"] = "syncing" if background_reviews else "idle"
+        if current_turn_id:
+            turns.pop(current_turn_id, None)
+        # LLM/session boundaries own only their turn.  A concurrently running
+        # tool (including Codex) remains active until its matching post event.
+        # post_llm/on_session_end normally follow all tool posts.  If a tool is
+        # still active, retain it: clearing it here caused running Codex calls
+        # to jump to idle when lifecycle events arrived out of order.
+        session["phase"] = (
+            "syncing" if any(item.get("review") and item.get("llm_active") for item in turns.values())
+            else "writing" if active or subagents or any(item.get("llm_active") for item in turns.values())
+            else "idle"
+        )
     elif event in ("on_session_finalize", "on_session_reset"):
         sessions.pop(current_session_id, None)
     else:
@@ -519,7 +554,12 @@ def locked_data(path, transition):
                 if not isinstance(data, dict):
                     raise ValueError("invalid state data")
         except (FileNotFoundError, ValueError, json.JSONDecodeError):
-            data = {"sessions": {}, "last_push": None}
+            data = {"schema_version": STATE_SCHEMA_VERSION, "sessions": {}, "last_push": None}
+        if data.get("schema_version") != STATE_SCHEMA_VERSION:
+            # Old entries lack turn ownership and activity leases.  They
+            # cannot be paired safely and previously polluted display state
+            # forever (the observed s1 fallback queue), so migrate cleanly.
+            data = {"schema_version": STATE_SCHEMA_VERSION, "sessions": {}, "last_push": None}
         result = transition(data)
         fd, temporary = tempfile.mkstemp(prefix=".hook-state-", dir=directory)
         try:
@@ -547,6 +587,8 @@ def run(payload):
             desired = {"sequence": sequence, "update": update}
             data["desired"] = desired
         if data.get("last_push") == update:
+            return None
+        if payload.get("hook_event_name") == "on_session_start" and state == "idle":
             return None
         return desired["sequence"], desired["update"]
 
